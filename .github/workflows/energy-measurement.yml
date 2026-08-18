@@ -341,6 +341,6 @@ jobs:
           # Internal notes are runner-local documents and stay out of the artifact.
           path: |
             ${{ env.HOME_DIR }}/experimentos/medicao/resultados/torchvision/
-            !${{ env.HOME_DIR }}/experimentos/medicao/resultados/torchvision/NOTA_FIDELIDADE.md
+            !${{ env.HOME_DIR }}/experimentos/medicao/resultados/torchvision/NOTA_FIDELIDADE*.md
           retention-days: 90
 
