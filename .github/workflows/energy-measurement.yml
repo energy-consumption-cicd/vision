@@ -1,0 +1,346 @@
+name: Energy Measurement
+
+# Dedicated workflow that invokes the locally validated run_pipeline.sh on a
+# self-hosted runner. It does not replace or modify the original CI workflows.
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign:
+        description: "validacao = apenas run 0 (smoke test) | completa = warm-up + runs 1..10 + mediana"
+        type: choice
+        required: true
+        default: validation
+        options:
+          - validation
+          - full
+
+jobs:
+  measure:
+    runs-on: [self-hosted, linux]
+    env:
+      # The Actions `env` context does not expose the runner process HOME.
+      HOME_DIR: /home/maycon
+    timeout-minutes: 1200
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Make RAPL counters readable
+        run: sudo /usr/local/bin/rapl-set-readable
+
+      - name: Check RAPL availability
+        run: |
+          if [ ! -d /sys/class/powercap/intel-rapl ]; then
+            echo "RAPL not available on this runner"
+            exit 1
+          fi
+          echo "Available RAPL domains:"
+          ls /sys/class/powercap/intel-rapl/
+
+      - name: Check Docker image
+        run: |
+          if ! docker image inspect torchvision-medicao &>/dev/null; then
+            echo "Image 'torchvision-medicao' not found on the runner."
+            echo "Build it manually before dispatching this workflow:"
+            echo "   docker build -t torchvision-medicao \\"
+            echo "     -f ~/experimentos/medicao/repositorios/vision/Dockerfile \\"
+            echo "     ~/experimentos/repositorios/inference-only/vision/"
+            exit 1
+          fi
+          echo "Docker image found."
+          docker image inspect torchvision-medicao --format '{{.Created}}'
+
+          if ! docker run --rm --network none torchvision-medicao bash -c \
+                 'W=/root/.cache/torch/hub/checkpoints/resnet50-11ad3fa6.pth; test -f "$W" && [ "$(stat -c%s "$W")" -gt 94000000 ]'; then
+            echo "Image 'torchvision-medicao' does NOT contain the pre-baked resnet50 weights."
+            echo "   Esperado: /root/.cache/torch/hub/checkpoints/resnet50-11ad3fa6.pth, >94 MB."
+            echo "   Reconstrua a imagem (ver Dockerfile, GATE 1)."
+            exit 1
+          fi
+          echo "Pre-baked weights present (resnet50 embedded)."
+
+          if ! docker run --rm --network none torchvision-medicao \
+                 conda run -n ci python -c "import torch, torchvision; assert torch.ops.torchvision.nms is not None"; then
+            echo "torchvision in the image does not load the C++ extension."
+            echo "   O stage 'test' falharia. Reconstrua (ver Dockerfile, GATE 2)."
+            exit 1
+          fi
+          echo "torchvision functional (C++ extension loaded, ops registered)."
+
+          GATE3_PY='import requests,urllib.request; r=requests.get("https://sourceforge.net/p/giflib/code/ci/master/tree/pic/fire.gif?format=raw",timeout=10); assert r.status_code==200 and r.content[:6] in (b"GIF87a",b"GIF89a"); u=urllib.request.urlopen("https://drive.google.com/file/d/XYZ/view",timeout=10); assert u.status==200 and u.url.endswith("/view")'
+          if ! docker run --rm --network none \
+                 --add-host sourceforge.net:127.0.0.1 \
+                 --add-host drive.google.com:127.0.0.1 \
+                 -e "GATE3_PY=$GATE3_PY" torchvision-medicao \
+                 bash -c 'cd /opt/prebake && sha256sum -c SHA256SUMS >/dev/null && test -s /root/.cache/torch/hub/checkpoints/mobilenet_v3_large-8738ca79.pth && conda run -n ci python -c "$GATE3_PY"'; then
+            echo "Pre-baked network resources missing or stub not responding."
+            echo "   19 testes falhariam por rede. Reconstrua com --build-context prebake=..."
+            exit 1
+          fi
+          echo "Pre-baked network resources present and stub responding."
+
+      - name: Validation run (run 0)
+        if: ${{ inputs.campaign == 'validation' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/torchvision/runs"
+
+          validate_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          PIPELINE_EXIT=0
+          bash "$HOME/experimentos/medicao/repositorios/vision/run_pipeline.sh" 0 \
+            || PIPELINE_EXIT=$?
+
+          # Run 0 is a smoke test; keep it out of the median aggregation glob.
+          mkdir -p "$RESULTS_DIR/validacao"
+          if [ -f "$RESULTS_DIR/run_00.csv" ]; then
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/validacao/run_00.csv"
+            echo "run_00.csv moved to runs/validacao/ (excluded from results)"
+          fi
+          if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
+            mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
+                  "$RESULTS_DIR/validacao/exit_codes_run_00.txt"
+            echo "exit_codes_run_00.txt movido junto (par CSV+sidecar preservado)"
+          fi
+
+          if ! validate_csv "$RESULTS_DIR/validacao/run_00.csv"; then
+            echo "::error title=Measurement failure::run 0: CSV missing or invalid at runs/validacao/run_00.csv (pipeline exit=$PIPELINE_EXIT)"
+            exit 1
+          fi
+          if [ "$PIPELINE_EXIT" -ne 0 ]; then
+            echo "::warning title=Unexpected exit code::run 0: run_pipeline.sh exited $PIPELINE_EXIT, but the measurement CSV is valid - review before the campaign"
+          fi
+          echo "run 0: valid measurement (workload exit=$PIPELINE_EXIT)"
+
+          awk -F, '
+            NR==1 { next }
+            ($2=="build" || $2=="test") && $7+0 > 0 {
+              r = ($8 + $9) / $7
+              if (r < 0.5)
+                printf "::warning::[run 0] stage %s: (user+sys)/wall = %.4f < 0.5 (user=%ss sys=%ss wall=%ss) - user/sys capture may have regressed to the host\n", $2, r, $8, $9, $7
+            }
+          ' "$RESULTS_DIR/validacao/run_00.csv"
+          awk -F, -v LIMIAR="${SWAP_WARN_PAGES:-256}" '
+            NR==1 { next }
+            NF >= 13 && ($2=="build" || $2=="test") && $13+0 > LIMIAR {
+              printf "::warning::[run 0] stage %s: swap_out_pages=%s (swap_in_pages=%s, limiar %s) - host paging occurred inside the measured window; run suspect for I/O contention\n", $2, $13, $12, LIMIAR
+            }
+          ' "$RESULTS_DIR/validacao/run_00.csv"
+
+      - name: Run 10 measurement runs
+        if: ${{ inputs.campaign == 'full' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/torchvision/runs"
+          PIPELINE="$HOME/experimentos/medicao/repositorios/vision/run_pipeline.sh"
+          # Ensure no validation run_00.csv pollutes the median.
+          rm -f "$RESULTS_DIR/run_00.csv"
+
+          ORDEM="$RESULTS_DIR/ordem_execucao.txt"
+          if [ ! -f "$ORDEM" ]; then
+            echo "# actual execution order (append-only) - run,start_utc,end_utc,exit,origin" > "$ORDEM"
+          fi
+          agora_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+          # A run CSV is valid when the aggregate stages are present and the critical energy/wall columns are non-empty and positive; user/sys columns are diagnostic and not validated.
+          validate_csv() {
+            local csv="$1"
+            [ -f "$csv" ] || return 1
+            awk -F, '
+              NR==1 { next }
+              $2=="build"||$2=="test"||$2=="total" {
+                seen[$2]=1
+                if ($3==""||$4==""||$7=="" || $3+0<=0 || $4+0<=0 || $7+0<=0) inval[$2]=1
+              }
+              END {
+                split("build test total", req, " ")
+                for (i in req) {
+                  s=req[i]
+                  if (!(s in seen)) exit 1
+                  if (s in inval)   exit 1
+                }
+                exit 0
+              }
+            ' "$csv"
+          }
+
+          # Non-blocking sanity check: (user+sys)/wall below 0.5 in CPU-bound stages indicates user/sys captured the host docker client instead of the container processes; energy and wall do not depend on these columns.
+          warn_user_sys() {
+            local csv="$1" origin="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origin="$origin" '
+              NR==1 { next }
+              ($2=="build" || $2=="test") && $7+0 > 0 {
+                r = ($8 + $9) / $7
+                if (r < 0.5)
+                  printf "::warning::[%s] stage %s: (user+sys)/wall = %.4f < 0.5 (user=%ss sys=%ss wall=%ss) - user/sys capture may have regressed to the host, OR the build compilation did not happen\n", origin, $2, r, $8, $9, $7
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          warn_swap() {
+            local csv="$1" origin="$2"
+            [ -f "$csv" ] || return 0
+            awk -F, -v origin="$origin" -v LIMIAR="${SWAP_WARN_PAGES:-256}" '
+              NR==1 { next }
+              NF >= 13 && ($2=="build" || $2=="test") && $13+0 > LIMIAR {
+                printf "::warning::[%s] stage %s: swap_out_pages=%s (swap_in_pages=%s, limiar %s) - host paging occurred inside the measured window; run suspect for I/O contention\n", origin, $2, $13, $12, LIMIAR
+              }
+            ' "$csv" | tee -a "$GITHUB_STEP_SUMMARY"
+            return 0
+          }
+
+          # Discarded warm-up convention: 11 runs, median over the 10 valid ones.
+          PENDING=0
+          for i in $(seq 1 10); do
+            validate_csv "$RESULTS_DIR/run_$(printf '%02d' "$i").csv" || PENDING=$((PENDING+1))
+          done
+          if [ "$PENDING" -gt 0 ]; then
+            echo "::group::Warm-up (discarded from analysis)"
+            echo "$PENDING pending run(s) - executing warm-up before official runs"
+            mkdir -p "$RESULTS_DIR/warmup"
+            WARMUP_EXIT=0
+            T_INI=$(agora_utc)
+            bash "$PIPELINE" 0 || WARMUP_EXIT=$?
+            echo "00,$T_INI,$(agora_utc),$WARMUP_EXIT,warmup" >> "$ORDEM"
+            if [ ! -f "$RESULTS_DIR/run_00.csv" ]; then
+              echo "::error title=Measurement failure::warm-up: run_pipeline.sh (exit=$WARMUP_EXIT) did not write run_00.csv - measurement failure, aborting the campaign"
+              exit 1
+            fi
+            mv -f "$RESULTS_DIR/run_00.csv" "$RESULTS_DIR/warmup/run_warmup.csv"
+            if [ -f "$RESULTS_DIR/exit_codes_run_00.txt" ]; then
+              mv -f "$RESULTS_DIR/exit_codes_run_00.txt" \
+                    "$RESULTS_DIR/warmup/exit_codes_run_warmup.txt"
+            fi
+            if [ "$WARMUP_EXIT" -ne 0 ]; then
+              echo "::warning title=Unexpected exit code::warm-up: run_pipeline.sh exited $WARMUP_EXIT; expected 0. Warm-up is discarded data; the campaign continues"
+            fi
+            warn_user_sys "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+            warn_swap "$RESULTS_DIR/warmup/run_warmup.csv" "warm-up"
+            {
+              echo "## Warm-up executed and DISCARDED (not in the median)"
+              echo "- $PENDING pending run(s) this session; CSV at \`runs/warmup/run_warmup.csv\` (overwritten each session)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            echo "Post-warm-up rest (120s)..."
+            sleep 120
+          else
+            echo "Campaign already complete (10 valid runs) - warm-up not needed"
+            echo "## Warm-up skipped - campaign already complete" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "## Execution (full mode) - skip-if-exists" >> "$GITHUB_STEP_SUMMARY"
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            CSV="$RESULTS_DIR/run_${NN}.csv"
+            echo "::group::Run $i of 10"
+            if validate_csv "$CSV"; then
+              echo "Run $NN already exists and is valid - skipping"
+              echo "- Run $NN: already valid - **skipped**" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              continue
+            fi
+            if [ -f "$CSV" ]; then
+              echo "Run $NN incomplete/invalid - re-executing (overwrite)"
+              echo "- Run $NN: invalid/incomplete CSV - **re-executed**" >> "$GITHUB_STEP_SUMMARY"
+              rm -f "$CSV"
+            else
+              echo "Run $NN missing - executing"
+              echo "- Run $NN: missing - **executed**" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            RUN_EXIT=0
+            T_INI=$(agora_utc)
+            bash "$PIPELINE" "$i" || RUN_EXIT=$?
+            echo "$NN,$T_INI,$(agora_utc),$RUN_EXIT,campanha" >> "$ORDEM"
+            warn_user_sys "$CSV" "run $NN"
+            warn_swap "$CSV" "run $NN"
+            if ! validate_csv "$CSV"; then
+              echo "::error title=Measurement failure::run $NN: CSV missing or invalid after the pipeline (exit=$RUN_EXIT). Energy/wall unusable - aborting the campaign"
+              echo "- Run $NN: **MEASUREMENT FAILURE** (pipeline exit=$RUN_EXIT) - campaign aborted" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if [ "$RUN_EXIT" -ne 0 ]; then
+              echo "::warning title=Unexpected exit code::run $NN: run_pipeline.sh exited $RUN_EXIT; expected 0. Run to REJECT and REPLACE per the declared exit-code list"
+              echo "- Run $NN: workload exit=$RUN_EXIT - **outside the declared list (0)**. Run to REJECT and REPLACE; CSV preserved" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "::endgroup::"
+            if [ "$i" -lt 10 ]; then
+              echo "Rest between runs (120s)..."
+              sleep 120
+            fi
+          done
+
+          # Final sweep also covers pre-existing runs skipped above.
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            warn_user_sys "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+            warn_swap "$RESULTS_DIR/run_${NN}.csv" "run $NN"
+          done
+
+          INVALIDAS=""
+          for i in $(seq 1 10); do
+            NN=$(printf '%02d' "$i")
+            validate_csv "$RESULTS_DIR/run_${NN}.csv" || INVALIDAS="${INVALIDAS:+$INVALIDAS }$NN"
+          done
+          if [ -n "$INVALIDAS" ]; then
+            echo "::error title=Incomplete campaign::runs with missing or invalid CSV: $INVALIDAS - medians will NOT be computed"
+            echo "- **Incomplete campaign** - invalid runs: $INVALIDAS" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "10 runs with valid CSVs - aggregate.py precondition satisfied"
+
+      - name: Aggregate medians
+        if: ${{ inputs.campaign == 'full' }}
+        run: |
+          RESULTS_DIR="$HOME/experimentos/medicao/resultados/torchvision/runs"
+          SUMMARY="$HOME/experimentos/medicao/resultados/torchvision/summary.csv"
+          python3 "$HOME/experimentos/medicao/scripts/aggregate.py" "$RESULTS_DIR" "$SUMMARY"
+          {
+            echo ""
+            echo "## Medians (10 runs) - torchvision"
+            echo '```'
+            cat "$SUMMARY"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Docker --privileged writes files as root in the workspace; fix ownership through a disposable container.
+      - name: Fix workspace permissions
+        if: always()
+        run: |
+          docker run --rm --privileged \
+            -v "${{ github.workspace }}":/w \
+            alpine chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-torchvision-${{ github.run_number }}
+          # Internal notes are runner-local documents and stay out of the artifact.
+          path: |
+            ${{ env.HOME_DIR }}/experimentos/medicao/resultados/torchvision/
+            !${{ env.HOME_DIR }}/experimentos/medicao/resultados/torchvision/NOTA_FIDELIDADE.md
+          retention-days: 90
+
