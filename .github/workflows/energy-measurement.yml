@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       campaign:
-        description: "validacao = apenas run 0 (smoke test) | completa = warm-up + runs 1..10 + mediana"
+        description: "validation = run 0 only (smoke test) | full = warm-up + runs 1..10 + median"
         type: choice
         required: true
         default: validation
