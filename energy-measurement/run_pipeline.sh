@@ -37,7 +37,7 @@ fi
 
 if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then
   echo "Docker image '$IMAGE_NAME' not found." >&2
-  echo "   Construa primeiro:" >&2
+  echo "  Build it first:" >&2
   echo "   docker build -t $IMAGE_NAME -f $MEDICAO_DIR/Dockerfile \\" >&2
   echo "     ~/experimentos/repositorios/inference-only/vision/" >&2
   exit 1
@@ -46,7 +46,7 @@ fi
 if ! docker run --rm --network none "$IMAGE_NAME" bash -c \
        'W=/root/.cache/torch/hub/checkpoints/resnet50-11ad3fa6.pth; test -f "$W" && [ "$(stat -c%s "$W")" -gt 94000000 ]'; then
   echo "Image '$IMAGE_NAME' does NOT contain the pre-baked resnet50 weights." >&2
-  echo "   O smoke_test.py morreria sob --network none. Reconstrua a imagem." >&2
+  echo "  smoke_test.py would fail under --network none. Rebuild the image." >&2
   exit 1
 fi
 
@@ -54,7 +54,7 @@ if ! docker run --rm --network none "$IMAGE_NAME" \
        conda run -n ci python -c "import torch, torchvision; assert torch.ops.torchvision.nms is not None" 2>/dev/null; then
   echo "torchvision in image '$IMAGE_NAME' does not load the C++ extension." >&2
   echo "   O stage 'test' falharia com 'operator torchvision::nms does not exist'." >&2
-  echo "   Reconstrua a imagem (ver Dockerfile, GATE 2)." >&2
+  echo "  Rebuild the image (see Dockerfile, GATE 2)." >&2
   exit 1
 fi
 
@@ -135,7 +135,7 @@ echo ""
 echo " Run $RUN_NUM - $PROJECT_NAME"
 echo " $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
-echo "⏳ Repouso para baseline (${BASELINE_DURATION}s)..."
+echo "Baseline rest (${BASELINE_DURATION}s)..."
 
 b_pkg_ini=$(read_rapl pkg)
 b_cores_ini=$(read_rapl cores)
@@ -164,7 +164,7 @@ taxa_cores=$(awk "BEGIN {printf \"%.6f\", $b_delta_cores / $BASELINE_DURATION}")
 taxa_gpu=$(awk  "BEGIN {printf \"%.6f\", $b_delta_gpu  / $BASELINE_DURATION}")
 taxa_ram=$(awk  "BEGIN {printf \"%.6f\", $b_delta_ram  / $BASELINE_DURATION}")
 
-echo " Baseline calculado:"
+echo "Baseline rate:"
 echo "   pkg:   $(awk "BEGIN {printf \"%.2f\", $taxa_pkg / 1e6}") W"
 echo "   cores: $(awk "BEGIN {printf \"%.2f\", $taxa_cores / 1e6}") W"
 echo "   ram:   $(awk "BEGIN {printf \"%.2f\", $taxa_ram / 1e6}") W"
@@ -226,7 +226,7 @@ measure_stage() {
       echo "::warning title=Stage exited non-zero::Run $RUN_NUM, stage '$stage': exit=$stage_exit. The CSV row WAS written."
     fi
   else
-    echo "    etapa '$stage': container saiu com exit=0"
+    echo "  stage '$stage': container exited 0"
   fi
 
   local fin_pkg fin_cores fin_gpu fin_ram
@@ -268,10 +268,10 @@ measure_stage() {
 
   j_ram_raw=$(awk "BEGIN {printf \"%.6f\", ($d_ram - $taxa_ram * $wall) / 1e6}")
 
-  echo "   ▶ ram: delta=${d_ram}µJ baseline=$(awk "BEGIN {printf \"%.0f\", $taxa_ram * $wall}")µJ net=$(awk "BEGIN {printf \"%.3f\", ($d_ram - $taxa_ram * $wall) / 1e6}")J  ${j_ram}J"
+  echo "  ram: delta=${d_ram}µJ baseline=$(awk "BEGIN {printf \"%.0f\", $taxa_ram * $wall}")µJ net=$(awk "BEGIN {printf \"%.3f\", ($d_ram - $taxa_ram * $wall) / 1e6}")J  ${j_ram}J"
 
   if [ "$swap_out" -gt "$SWAP_WARN_PAGES" ]; then
-    echo "     PAGINAÇÃO DO HOST na etapa '$stage': swap_out_pages=$swap_out (swap_in_pages=$swap_in)"
+    echo "  HOST PAGING in stage '$stage': swap_out_pages=$swap_out (swap_in_pages=$swap_in)"
     echo "::warning title=Host paging during measurement::Run $RUN_NUM, stage '$stage': swap_out_pages=$swap_out (> $SWAP_WARN_PAGES pages = $((SWAP_WARN_PAGES*4/1024)) MiB). The host was under memory pressure inside the measured window (the container itself cannot page: memory.swap.max=0). Run suspect for I/O contention - review before including it in the valid set."
   elif [ "$swap_out" -gt 0 ]; then
     echo "  swap_out_pages=$swap_out (below the $SWAP_WARN_PAGES threshold - noise, no alert)"
@@ -330,6 +330,6 @@ rm -f "$TIME_FILE"
 
 if [ "$PIPELINE_EXIT" -ne 0 ]; then
   echo "Run $RUN_NUM: stage(s) with non-zero exit  $FAILED_STAGES"
-  echo "   CSV completo em $CSV_FILE · exit codes em $EXITS_FILE"
+  echo "  CSV: $CSV_FILE  exit codes: $EXITS_FILE"
   exit "$PIPELINE_EXIT"
 fi

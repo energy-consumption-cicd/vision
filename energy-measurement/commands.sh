@@ -40,7 +40,7 @@ case "$STAGE" in
         "$@"
         local rc=$?
         set -e
-        echo "=== BLOCK ${nome} - end: $(date -u +%FT%TZ) · exit=${rc} ==="
+        echo "=== BLOCK ${nome} - end: $(date -u +%FT%TZ) exit=${rc} ==="
         if [ "$rc" -ne 0 ] && [ "$BLOCK_EXIT" -eq 0 ]; then
             BLOCK_EXIT="$rc"
         fi
@@ -60,7 +60,7 @@ case "$STAGE" in
         --junit-xml=/project/test-results-C.xml \
         -v --durations=25 -k "not TestFxFeatureExtraction"
 
-    echo "=== stage test: exit agregado = ${BLOCK_EXIT} ==="
+    echo "=== stage test: aggregated exit = ${BLOCK_EXIT} ==="
     exit "$BLOCK_EXIT"
     ;;
 
